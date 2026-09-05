@@ -10,3 +10,15 @@ class ResConfigSettings(models.TransientModel):
     sign_oca_send_sign_request_copy = fields.Boolean(
         related="company_id.sign_oca_send_sign_request_copy", readonly=False
     )
+    sign_oca_reminder_enabled = fields.Boolean(
+        related="company_id.sign_oca_reminder_enabled",
+        readonly=False,
+    )
+    sign_oca_reminder_interval_days = fields.Integer(
+        related="company_id.sign_oca_reminder_interval_days",
+        readonly=False,
+    )
+    sign_oca_validity_days = fields.Integer(
+        related="company_id.sign_oca_validity_days",
+        readonly=False,
+    )

@@ -310,3 +310,49 @@ class TestSequentialSigning(BaseCommon):
         self.env["sign.oca.request"]._cron_send_reminders()
 
         self.assertEqual(request.state, "3_cancel")
+
+    def test_sequence_convention_and_aliases(self):
+        """Verify standard 'sequence' convention works and matches 'signing_order'."""
+        request = self.env["sign.oca.request"].create(
+            {
+                "data": self.data,
+                "name": "Test Sequence Convention",
+                "signing_mode": "sequential",
+                "signer_ids": [
+                    (
+                        0,
+                        0,
+                        {
+                            "partner_id": self.partner_1.id,
+                            "role_id": self.role_customer.id,
+                            "sequence": 1,
+                        },
+                    ),
+                    (
+                        0,
+                        0,
+                        {
+                            "partner_id": self.partner_2.id,
+                            "role_id": self.role_customer.id,
+                            "sequence": 2,
+                        },
+                    ),
+                ],
+            }
+        )
+        request.action_send()
+        signer_1 = self._get_signer_by_partner(request, self.partner_1)
+        signer_2 = self._get_signer_by_partner(request, self.partner_2)
+
+        self.assertEqual(signer_1.sequence, 1)
+        self.assertEqual(signer_1.signing_order, 1)
+        self.assertEqual(signer_2.sequence, 2)
+        self.assertEqual(signer_2.signing_order, 2)
+        self.assertEqual(request.current_sequence, 1)
+        self.assertEqual(request.current_signing_order, 1)
+
+        signer_1.signed_on = fields.Datetime.now()
+        request._check_signed()
+
+        self.assertEqual(request.current_sequence, 2)
+        self.assertEqual(request.current_signing_order, 2)

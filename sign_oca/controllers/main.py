@@ -49,6 +49,19 @@ class PortalSign(CustomerPortal):
                     "company": signer_sudo.request_id.company_id,
                 },
             )
+        sign_request = signer_sudo.request_id
+        if (
+            sign_request.signing_mode == "sequential"
+            and signer_sudo.signer_state == "waiting"
+        ):
+            return request.render(
+                "sign_oca.portal_sign_document_waiting",
+                {
+                    "signer": signer_sudo,
+                    "company": sign_request.company_id,
+                    "request_name": sign_request.name,
+                },
+            )
         return request.render(
             "sign_oca.portal_sign_document",
             {
@@ -111,6 +124,11 @@ class PortalSign(CustomerPortal):
             )
         except (AccessError, MissingError):
             return request.redirect("/my")
+        if (
+            signer_sudo.request_id.signing_mode == "sequential"
+            and signer_sudo.signer_state == "waiting"
+        ):
+            return {"error": "It is not your turn to sign yet."}
         return signer_sudo.action_sign(
             items, access_token=access_token, latitude=latitude, longitude=longitude
         )

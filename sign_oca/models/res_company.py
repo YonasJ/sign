@@ -12,3 +12,19 @@ class ResCompany(models.Model):
         help="Once all signers have signed the request, a copy of "
         "the final document will be sent to each of them.",
     )
+    sign_oca_reminder_enabled = fields.Boolean(
+        string="Enable Automatic Reminders",
+        default=False,
+        help="Enable automatic email reminders for pending sign requests.",
+    )
+    sign_oca_reminder_interval_days = fields.Integer(
+        string="Reminder Interval (Days)",
+        default=3,
+        help="Number of days between automatic reminders for pending sign requests.",
+    )
+    sign_oca_validity_days = fields.Integer(
+        string="Default Validity (Days)",
+        default=0,
+        help="Default number of days before a sign request expires. "
+        "0 means no expiration.",
+    )

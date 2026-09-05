@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 from base64 import b64decode, b64encode
+from datetime import timedelta
 from hashlib import sha256
 from io import BytesIO
 
@@ -90,6 +91,124 @@ class SignOcaRequest(models.Model):
     )
     next_item_id = fields.Integer(compute="_compute_next_item_id")
     ask_location = fields.Boolean()
+
+    # Sequential Signing & CC
+    signing_mode = fields.Selection(
+        selection=[
+            ("parallel", "Parallel (All at once)"),
+            ("sequential", "Sequential (Ordered)"),
+        ],
+        default="parallel",
+        required=True,
+        copy=True,
+    )
+    cc_partner_ids = fields.Many2many(
+        comodel_name="res.partner",
+        relation="sign_oca_request_cc_partner_rel",
+        column1="request_id",
+        column2="partner_id",
+        string="CC Recipients",
+    )
+    current_sequence = fields.Integer(
+        default=0,
+        copy=False,
+        readonly=True,
+        string="Current Sequence",
+    )
+    current_signing_order = fields.Integer(
+        related="current_sequence",
+        readonly=False,
+        string="Current Signing Order (Deprecated)",
+        help="Deprecated alias for current_sequence.",
+    )
+
+    # Reminders & Expiration
+    sent_date = fields.Datetime(
+        copy=False,
+        readonly=True,
+        help="Date and time when the request was sent to signers.",
+    )
+    reminder_enabled = fields.Boolean(
+        string="Automatic Reminders",
+        help="Send periodic email reminders to unsigned signers.",
+    )
+    reminder_interval_days = fields.Integer(
+        string="Reminder Interval (Days)",
+        help="Number of days between automatic reminders.",
+    )
+    last_reminder_date = fields.Datetime(
+        string="Last Reminder Sent",
+        copy=False,
+        readonly=True,
+    )
+    reminder_count = fields.Integer(
+        string="Reminders Sent",
+        default=0,
+        copy=False,
+        readonly=True,
+    )
+    validity_date = fields.Date(
+        string="Expiration Date",
+        copy=False,
+        help="Date after which the request will be automatically cancelled.",
+    )
+    is_expired = fields.Boolean(
+        compute="_compute_is_expired",
+        string="Expired",
+    )
+    next_reminder_date = fields.Datetime(
+        compute="_compute_next_reminder_date",
+        store=True,
+        string="Next Reminder",
+    )
+
+    @api.depends("validity_date")
+    def _compute_is_expired(self):
+        today = fields.Date.context_today(self)
+        for record in self:
+            record.is_expired = bool(
+                record.validity_date and record.validity_date < today
+            )
+
+    @api.depends(
+        "reminder_enabled",
+        "reminder_interval_days",
+        "sent_date",
+        "last_reminder_date",
+        "state",
+    )
+    def _compute_next_reminder_date(self):
+        for record in self:
+            if (
+                not record.reminder_enabled
+                or record.state != "0_sent"
+                or not record.reminder_interval_days
+            ):
+                record.next_reminder_date = False
+                continue
+            base_date = record.last_reminder_date or record.sent_date
+            if not base_date:
+                record.next_reminder_date = False
+                continue
+            record.next_reminder_date = base_date + timedelta(
+                days=record.reminder_interval_days
+            )
+
+    @api.model
+    def default_get(self, fields_list):
+        defaults = super().default_get(fields_list)
+        company = self.env.company
+        if "reminder_enabled" in fields_list:
+            defaults["reminder_enabled"] = company.sign_oca_reminder_enabled
+        if "reminder_interval_days" in fields_list:
+            defaults["reminder_interval_days"] = (
+                company.sign_oca_reminder_interval_days or 3
+            )
+        if "validity_date" in fields_list and company.sign_oca_validity_days:
+            defaults["validity_date"] = fields.Date.context_today(self) + timedelta(
+                days=company.sign_oca_validity_days
+            )
+        return defaults
 
     @api.depends("signer_ids")
     @api.depends_context("uid")
@@ -243,12 +362,23 @@ class SignOcaRequest(models.Model):
         return self.template_id.configure()
 
     def action_send(self, sign_now=False, message=""):
+        for record in self:
+            if record.state != "1_draft":
+                continue
+            if not record.sent_date:
+                record.sent_date = fields.Datetime.now()
+            if record.signing_mode == "sequential":
+                record._action_send_sequential(sign_now=sign_now, message=message)
+            else:
+                record._action_send_parallel(sign_now=sign_now, message=message)
+        return True
+
+    def _action_send_parallel(self, sign_now=False, message=""):
         self.ensure_one()
-        if self.state != "1_draft":
-            return
         self._set_action_log("validate")
         self.state = "0_sent"
         for signer in self.signer_ids:
+            signer.signer_state = "sent"
             signer._portal_ensure_token()
             if sign_now and signer.partner_id == self.env.user.partner_id:
                 continue
@@ -267,6 +397,155 @@ class SignOcaRequest(models.Model):
                 email_layout_xmlid="mail.mail_notification_light",
             )
 
+    def _action_send_sequential(self, sign_now=False, message=""):
+        self.ensure_one()
+        self._set_action_log("validate")
+        self.state = "0_sent"
+
+        sequences = self.signer_ids.mapped("sequence")
+        first_seq = min(sequences) if sequences else 10
+        self.current_sequence = first_seq
+
+        for signer in self.signer_ids:
+            signer._portal_ensure_token()
+            if signer.sequence == first_seq:
+                signer.signer_state = "sent"
+            else:
+                signer.signer_state = "waiting"
+
+        first_signers = self.signer_ids.filtered(lambda s: s.sequence == first_seq)
+        self._send_signing_notification(
+            first_signers,
+            sign_now=sign_now,
+            message=message,
+        )
+
+    def _send_signing_notification(self, signers, sign_now=False, message=""):
+        self.ensure_one()
+        for signer in signers:
+            signer._portal_ensure_token()
+            if sign_now and signer.partner_id == self.env.user.partner_id:
+                continue
+            base_url = signer.get_base_url()
+            access_url = signer.access_url
+            if not access_url.startswith("http"):
+                access_url = base_url + access_url
+            render_result = self.env["ir.qweb"]._render(
+                "sign_oca.sign_oca_sequential_initial_mail",
+                {
+                    "record": self,
+                    "signer": signer,
+                    "body": message,
+                    "link": access_url,
+                },
+                engine="ir.qweb",
+                minimal_qcontext=True,
+            )
+            self.env["mail.thread"].message_notify(
+                body=render_result,
+                partner_ids=signer.partner_id.ids,
+                subject=self.env._("New document to sign"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+                mail_auto_delete=False,
+                email_layout_xmlid="mail.mail_notification_light",
+            )
+
+    def _send_next_step_notification(self, signers):
+        self.ensure_one()
+        for signer in signers:
+            signer._portal_ensure_token()
+            base_url = signer.get_base_url()
+            access_url = signer.access_url
+            if not access_url.startswith("http"):
+                access_url = base_url + access_url
+            render_result = self.env["ir.qweb"]._render(
+                "sign_oca.sign_oca_your_turn_mail",
+                {
+                    "record": self,
+                    "signer": signer,
+                    "link": access_url,
+                },
+                engine="ir.qweb",
+                minimal_qcontext=True,
+            )
+            self.env["mail.thread"].message_notify(
+                body=render_result,
+                partner_ids=signer.partner_id.ids,
+                subject=self.env._("Your turn to sign: %s") % self.name,
+                subtype_id=self.env.ref("mail.mt_comment").id,
+                mail_auto_delete=False,
+                email_layout_xmlid="mail.mail_notification_light",
+            )
+
+    def _advance_to_next_step(self):
+        self.ensure_one()
+        if self.signing_mode != "sequential":
+            return
+        current_step_signers = self.signer_ids.filtered(
+            lambda s: s.sequence == self.current_sequence
+        )
+        if not all(s.signed_on for s in current_step_signers):
+            return
+        remaining_seqs = self.signer_ids.filtered(
+            lambda s: not s.signed_on and s.sequence > self.current_sequence
+        ).mapped("sequence")
+        if remaining_seqs:
+            next_seq = min(remaining_seqs)
+            self.current_sequence = next_seq
+            next_signers = self.signer_ids.filtered(
+                lambda s: s.sequence == next_seq
+            )
+            for signer in next_signers:
+                signer.signer_state = "sent"
+            self._send_next_step_notification(next_signers)
+            self._set_action_log("advance_step")
+
+    def _check_signed(self):
+        self.ensure_one()
+        if self.state != "0_sent":
+            return
+        for signer in self.signer_ids:
+            if signer.signed_on and signer.signer_state != "signed":
+                signer.signer_state = "signed"
+        if self.signing_mode == "sequential":
+            self._advance_to_next_step()
+        if all(self.mapped("signer_ids.signed_on")):
+            self.state = "2_signed"
+            if self.reminder_enabled:
+                self.reminder_enabled = False
+            self.action_send_signed_request()
+            self._send_cc_notification()
+
+    def _send_cc_notification(self):
+        self.ensure_one()
+        if not self.cc_partner_ids:
+            return
+        attachment = self.env["ir.attachment"].create(
+            {
+                "name": self.filename or f"{self.name}.pdf",
+                "res_model": "sign.oca.request",
+                "res_id": self.id,
+                "datas": self.data,
+                "type": "binary",
+            }
+        )
+        render_result = self.env["ir.qweb"]._render(
+            "sign_oca.sign_oca_cc_notification_mail",
+            {"record": self},
+            engine="ir.qweb",
+            minimal_qcontext=True,
+        )
+        self.env["mail.thread"].message_notify(
+            body=render_result,
+            partner_ids=self.cc_partner_ids.ids,
+            subject=self.env._("Document signed: %s") % self.name,
+            subtype_id=self.env.ref("mail.mt_comment").id,
+            mail_auto_delete=False,
+            attachment_ids=[attachment.id],
+            email_layout_xmlid="mail.mail_notification_light",
+        )
+        self._set_action_log("cc_notify")
+
     def action_send_signed_request(self):
         self.ensure_one()
         if (
@@ -274,39 +553,164 @@ class SignOcaRequest(models.Model):
             or not self.env.company.sign_oca_send_sign_request_copy
         ):
             return
-        for signer in self.signer_ids:
-            attachments = (
-                self.env["ir.attachment"]
-                .sudo()
-                .search(
-                    [
-                        ("res_model", "=", "sign.oca.request"),
-                        ("res_id", "=", self.id),
-                        ("res_field", "=", "data"),
-                    ]
-                )
+        attachment = (
+            self.env["ir.attachment"]
+            .sudo()
+            .search(
+                [
+                    ("res_model", "=", "sign.oca.request"),
+                    ("res_id", "=", self.id),
+                    ("res_field", "=", "data"),
+                ],
+                limit=1,
             )
-            # The message will not be linked to the record because we do not want
-            # it happen.
-            self.env["mail.thread"].message_notify(
-                body=self.env._(
-                    "%(name)s (%(email)s) has sent the signed document.",
-                    name=self.create_uid.name,
-                    email=self.create_uid.email,
-                ),
-                partner_ids=signer.partner_id.ids,
-                subject=self.env._("Signed document"),
-                subtype_id=self.env.ref("mail.mt_comment").id,
-                mail_auto_delete=False,
-                attachment_ids=attachments.ids,
+        )
+        if not attachment:
+            attachment = self.env["ir.attachment"].create(
+                {
+                    "name": self.filename or f"{self.name}.pdf",
+                    "res_model": "sign.oca.request",
+                    "res_id": self.id,
+                    "datas": self.data,
+                    "type": "binary",
+                }
             )
+        render_result = self.env["ir.qweb"]._render(
+            "sign_oca.sign_oca_signed_copy_mail",
+            {"record": self},
+            engine="ir.qweb",
+            minimal_qcontext=True,
+        )
+        self.env["mail.thread"].message_notify(
+            body=render_result,
+            partner_ids=self.signer_ids.mapped("partner_id").ids,
+            subject=self.env._("Document signed: %s") % self.name,
+            subtype_id=self.env.ref("mail.mt_comment").id,
+            mail_auto_delete=False,
+            attachment_ids=[attachment.id],
+            email_layout_xmlid="mail.mail_notification_light",
+        )
 
-    def _check_signed(self):
+    def action_resend(self):
         self.ensure_one()
         if self.state != "0_sent":
             return
-        if all(self.mapped("signer_ids.signed_on")):
-            self.state = "2_signed"
+        if self.signing_mode == "sequential":
+            signers_to_remind = self.signer_ids.filtered(
+                lambda s: not s.signed_on and s.sequence == self.current_sequence
+            )
+        else:
+            signers_to_remind = self.signer_ids.filtered(lambda s: not s.signed_on)
+        if not signers_to_remind:
+            return
+        self._send_reminder_to_signers(signers_to_remind, is_manual=True)
+        self._set_action_log("resend")
+
+    def _send_reminder_to_signers(self, signers, is_manual=False):
+        self.ensure_one()
+        base_url = self.env["ir.config_parameter"].sudo().get_param("web.base.url", "")
+        for signer in signers:
+            signer._portal_ensure_token()
+            access_url = signer.access_url
+            if not access_url.startswith("http"):
+                access_url = base_url + access_url
+            render_result = self.env["ir.qweb"]._render(
+                "sign_oca.sign_oca_reminder_mail",
+                {
+                    "record": self,
+                    "signer": signer,
+                    "link": access_url,
+                    "is_manual": is_manual,
+                },
+                engine="ir.qweb",
+                minimal_qcontext=True,
+            )
+            subject = self.env._("Reminder: %s awaiting your signature") % self.name
+            self.env["mail.thread"].message_notify(
+                body=render_result,
+                partner_ids=signer.partner_id.ids,
+                subject=subject,
+                subtype_id=self.env.ref("mail.mt_comment").id,
+                mail_auto_delete=False,
+                email_layout_xmlid="mail.mail_notification_light",
+            )
+        now = fields.Datetime.now()
+        self.write(
+            {
+                "last_reminder_date": now,
+                "reminder_count": self.reminder_count + 1,
+            }
+        )
+        if not is_manual:
+            self._set_action_log("reminder")
+
+    @api.model
+    def _cron_send_reminders(self):
+        today = fields.Date.context_today(self)
+        now = fields.Datetime.now()
+
+        # Phase 1: Expire overdue requests
+        expired_requests = self.search(
+            [
+                ("state", "=", "0_sent"),
+                ("validity_date", "!=", False),
+                ("validity_date", "<", today),
+            ]
+        )
+        for request in expired_requests:
+            try:
+                request._expire_request()
+            except Exception:
+                _logger.exception(
+                    "Failed to expire sign request %s (id=%s)",
+                    request.name,
+                    request.id,
+                )
+
+        # Phase 2: Send reminders
+        due_requests = self.search(
+            [
+                ("state", "=", "0_sent"),
+                ("reminder_enabled", "=", True),
+                ("next_reminder_date", "<=", now),
+            ]
+        )
+        for request in due_requests:
+            try:
+                if request.signing_mode == "sequential":
+                    unsigned_signers = request.signer_ids.filtered(
+                        lambda s: not s.signed_on and s.sequence == request.current_sequence
+                    )
+                else:
+                    unsigned_signers = request.signer_ids.filtered(
+                        lambda s: not s.signed_on
+                    )
+                if unsigned_signers:
+                    request._send_reminder_to_signers(unsigned_signers)
+            except Exception:
+                _logger.exception(
+                    "Failed to send reminder for sign request %s (id=%s)",
+                    request.name,
+                    request.id,
+                )
+
+    def _expire_request(self):
+        self.ensure_one()
+        self.write({"state": "3_cancel"})
+        self._set_action_log("expire")
+        body = self.env._(
+            "The sign request <b>%(name)s</b> has expired because it was not "
+            "completed before the expiration date (%(validity_date)s).",
+            name=self.name,
+            validity_date=self.validity_date,
+        )
+        self.env["mail.thread"].message_notify(
+            body=body,
+            partner_ids=self.create_uid.partner_id.ids,
+            subject=self.env._("Sign request expired: %s") % self.name,
+            subtype_id=self.env.ref("mail.mt_comment").id,
+            mail_auto_delete=False,
+        )
 
     def _set_action_log_vals(self, action, **kwargs):
         vals = kwargs.copy()
@@ -341,7 +745,33 @@ class SignOcaRequestSigner(models.Model):
     _name = "sign.oca.request.signer"
     _inherit = ["portal.mixin", "mail.thread", "mail.activity.mixin"]
     _description = "Sign Request Value"
-    _order = "signed_on desc, create_date desc, id desc"
+    _order = "sequence, signed_on desc, create_date desc, id desc"
+
+    sequence = fields.Integer(
+        default=10,
+        string="Sequence",
+        help=(
+            "Order in which this signer signs. Lower values go first. "
+            "Signers with the same value sign in parallel."
+        ),
+    )
+    signing_order = fields.Integer(
+        related="sequence",
+        readonly=False,
+        string="Signing Order (Deprecated)",
+        help="Deprecated alias for sequence.",
+    )
+    signer_state = fields.Selection(
+        selection=[
+            ("draft", "Draft"),
+            ("waiting", "Waiting"),
+            ("sent", "Sent"),
+            ("signed", "Signed"),
+        ],
+        default="draft",
+        copy=False,
+        readonly=True,
+    )
 
     data = fields.Binary(related="request_id.data")
     request_id = fields.Many2one("sign.oca.request", required=True, ondelete="cascade")
@@ -440,6 +870,16 @@ class SignOcaRequestSigner(models.Model):
             )
         if self.request_id.state != "0_sent":
             raise ValidationError(self.env._("Request cannot be signed"))
+        if (
+            self.request_id.signing_mode == "sequential"
+            and self.signer_state == "waiting"
+        ):
+            raise UserError(
+                self.env._(
+                    "It is not your turn to sign this document yet. "
+                    "Please wait for the previous signers to complete."
+                )
+            )
         self.signed_on = fields.Datetime.now()
         # current_hash = self.request_id.current_hash
         signatory_data = self.request_id.signatory_data
@@ -713,6 +1153,11 @@ class SignRequestLog(models.Model):
             ("delete_field", "Delete field"),
             ("cancel", "Cancel"),
             ("configure", "Configure"),
+            ("advance_step", "Advance Signing Step"),
+            ("cc_notify", "CC Notification"),
+            ("resend", "Resend"),
+            ("expire", "Expire"),
+            ("reminder", "Reminder"),
         ],
         required=True,
     )
