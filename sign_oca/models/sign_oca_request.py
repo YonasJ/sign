@@ -448,8 +448,9 @@ class SignOcaRequestSigner(models.Model):
         reader = PdfFileReader(input_data)
         output = PdfFileWriter()
         pages = {}
-        for page_number in range(1, reader.numPages + 1):
-            pages[page_number] = reader.getPage(page_number - 1)
+        num_pages = len(reader.pages) if hasattr(reader, 'pages') else reader.numPages
+        for page_number in range(1, num_pages + 1):
+            pages[page_number] = reader.pages[page_number - 1] if hasattr(reader, 'pages') else reader.getPage(page_number - 1)
 
         for key in signatory_data:
             if signatory_data[key]["role_id"] == self.role_id.id:
@@ -457,12 +458,19 @@ class SignOcaRequestSigner(models.Model):
                 self._check_signable(items[key])
                 item = items[key]
                 page = pages[item["page"]]
-                new_page = self._get_pdf_page(item, page.mediaBox)
+                box = getattr(page, 'mediabox', None) or getattr(page, 'mediaBox', None)
+                new_page = self._get_pdf_page(item, box)
                 if new_page:
-                    page.mergePage(new_page)
+                    if hasattr(page, 'merge_page'):
+                        page.merge_page(new_page)
+                    else:
+                        page.mergePage(new_page)
                 pages[item["page"]] = page
         for page_number in pages:
-            output.addPage(pages[page_number])
+            if hasattr(output, 'add_page'):
+                output.add_page(pages[page_number])
+            else:
+                output.addPage(pages[page_number])
         output_stream = BytesIO()
         output.write(output_stream)
         output_stream.seek(0)
@@ -502,34 +510,41 @@ class SignOcaRequestSigner(models.Model):
         if not item["value"]:
             raise ValidationError(self.env._("Field %s is not filled") % item["name"])
 
+    def _get_box_dimensions(self, box):
+        width = float(getattr(box, 'width', None) or box.getWidth())
+        height = float(getattr(box, 'height', None) or box.getHeight())
+        return width, height
+
     def _get_pdf_page_text(self, item, box):
         packet = BytesIO()
-        can = canvas.Canvas(packet, pagesize=(box.getWidth(), box.getHeight()))
+        box_w, box_h = self._get_box_dimensions(box)
+        can = canvas.Canvas(packet, pagesize=(box_w, box_h))
         if not item["value"]:
             return False
-        par = Paragraph(item["value"], style=self._getParagraphStyle())
-        par.wrap(
-            item["width"] / 100 * float(box.getWidth()),
-            item["height"] / 100 * float(box.getHeight()),
-        )
-        par.drawOn(
-            can,
-            item["position_x"] / 100 * float(box.getWidth()),
-            (100 - item["position_y"] - item["height"]) / 100 * float(box.getHeight()),
-        )
+        par = Paragraph(str(item["value"]), style=self._getParagraphStyle())
+        item_w = (item.get("width") or 20.0) / 100 * box_w
+        item_h = (item.get("height") or 5.0) / 100 * box_h
+        par.wrap(item_w, item_h)
+        pos_x = (item.get("position_x", 0) / 100.0) * box_w
+        pos_y = ((100.0 - item.get("position_y", 0) - (item.get("height") or 5.0)) / 100.0) * box_h
+        if hasattr(par, 'blPara') and par.blPara:
+            par.drawOn(can, pos_x, pos_y)
+        else:
+            can.drawString(pos_x, pos_y, str(item["value"]))
         can.save()
         packet.seek(0)
         new_pdf = PdfFileReader(packet)
-        return new_pdf.getPage(0)
+        return new_pdf.pages[0] if hasattr(new_pdf, 'pages') else new_pdf.getPage(0)
 
     def _getParagraphStyle(self):
         return ParagraphStyle(name="Oca Sign Style")
 
     def _get_pdf_page_check(self, item, box):
         packet = BytesIO()
-        can = canvas.Canvas(packet, pagesize=(box.getWidth(), box.getHeight()))
-        width = item["width"] / 100 * float(box.getWidth())
-        height = item["height"] / 100 * float(box.getHeight())
+        box_w, box_h = self._get_box_dimensions(box)
+        can = canvas.Canvas(packet, pagesize=(box_w, box_h))
+        width = item["width"] / 100 * box_w
+        height = item["height"] / 100 * box_h
         drawing = Drawing(width=width, height=height)
         drawing.add(
             Rect(
@@ -547,17 +562,18 @@ class SignOcaRequestSigner(models.Model):
             drawing.add(Line(0, height, width, 0, strokeColor=black, strokeWidth=3))
         drawing.drawOn(
             can,
-            item["position_x"] / 100 * float(box.getWidth()),
-            (100 - item["position_y"] - item["height"]) / 100 * float(box.getHeight()),
+            item["position_x"] / 100 * box_w,
+            (100 - item["position_y"] - item["height"]) / 100 * box_h,
         )
         can.save()
         packet.seek(0)
         new_pdf = PdfFileReader(packet)
-        return new_pdf.getPage(0)
+        return new_pdf.pages[0] if hasattr(new_pdf, 'pages') else new_pdf.getPage(0)
 
     def _get_pdf_page_signature(self, item, box):
         packet = BytesIO()
-        can = canvas.Canvas(packet, pagesize=(box.getWidth(), box.getHeight()))
+        box_w, box_h = self._get_box_dimensions(box)
+        can = canvas.Canvas(packet, pagesize=(box_w, box_h))
         if not item["value"]:
             return False
         try:
@@ -569,15 +585,15 @@ class SignOcaRequestSigner(models.Model):
             image_data = b64decode(base64_str)
             par = Image(
                 BytesIO(image_data),
-                width=item["width"] / 100 * float(box.getWidth()),
-                height=item["height"] / 100 * float(box.getHeight()),
+                width=item["width"] / 100 * box_w,
+                height=item["height"] / 100 * box_h,
             )
             par.drawOn(
                 can,
-                item["position_x"] / 100 * float(box.getWidth()),
+                item["position_x"] / 100 * box_w,
                 (100 - item["position_y"] - item["height"])
                 / 100
-                * float(box.getHeight()),
+                * box_h,
             )
         except Exception as e:
             _logger.info(f"Error decoding Base64 string: {e}")
@@ -585,7 +601,7 @@ class SignOcaRequestSigner(models.Model):
         can.save()
         packet.seek(0)
         new_pdf = PdfFileReader(packet)
-        return new_pdf.getPage(0)
+        return new_pdf.pages[0] if hasattr(new_pdf, 'pages') else new_pdf.getPage(0)
 
     def _get_pdf_page(self, item, box):
         return getattr(self, f"_get_pdf_page_{ item['field_type'] }")(item, box)
